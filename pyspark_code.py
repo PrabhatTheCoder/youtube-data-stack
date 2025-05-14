@@ -1,84 +1,47 @@
-import sys
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from awsglue.dynamicframe import DynamicFrame
-from awsglue.transforms import ApplyMapping, ResolveChoice, DropNullFields
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
 
-# Get job arguments
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+spark = SparkSession.builder \
+    .appName("Read Partitioned CSV") \
+    .getOrCreate()
 
-# Initialize contexts and job
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+input_path = "s3://youtube-raw-data-apsouth1-s3/youtube/raw_statistics/"
 
-# Pushdown predicate to filter specific regions
-predicate_pushdown = "region in ('ca','gb','us')"
+df = spark.read.option("header", "true") \
+    .option("inferSchema", "true") \
+    .csv(input_path)
 
-# Load data from Glue Catalog
-datasource0 = glueContext.create_dynamic_frame.from_catalog(
-    database="db_youtube_raw",
-    table_name="raw_statistics",
-    transformation_ctx="datasource0",
-    push_down_predicate=predicate_pushdown
+filtered_df = df.filter(col("region").isin("ca", "gb", "us"))
+
+selected_df = filtered_df.select(
+    col("video_id").cast("string"),
+    col("trending_date").cast("string"),
+    col("title").cast("string"),
+    col("channel_title").cast("string"),
+    col("category_id").cast("bigint"),
+    col("publish_time").cast("string"),
+    col("tags").cast("string"),
+    col("views").cast("bigint"),
+    col("likes").cast("bigint"),
+    col("dislikes").cast("bigint"),
+    col("comment_count").cast("bigint"),
+    col("thumbnail_link").cast("string"),
+    col("comments_disabled").cast("boolean"),
+    col("ratings_disabled").cast("boolean"),
+    col("video_error_or_removed").cast("boolean"),
+    col("description").cast("string"),
+    col("region").cast("string")
 )
 
-# Apply mappings
-applymapping1 = ApplyMapping.apply(
-    frame=datasource0,
-    mappings=[
-        ("video_id", "string", "video_id", "string"),
-        ("trending_date", "string", "trending_date", "string"),
-        ("title", "string", "title", "string"),
-        ("channel_title", "string", "channel_title", "string"),
-        ("category_id", "long", "category_id", "long"),
-        ("publish_time", "string", "publish_time", "string"),
-        ("tags", "string", "tags", "string"),
-        ("views", "long", "views", "long"),
-        ("likes", "long", "likes", "long"),
-        ("dislikes", "long", "dislikes", "long"),
-        ("comment_count", "long", "comment_count", "long"),
-        ("thumbnail_link", "string", "thumbnail_link", "string"),
-        ("comments_disabled", "boolean", "comments_disabled", "boolean"),
-        ("ratings_disabled", "boolean", "ratings_disabled", "boolean"),
-        ("video_error_or_removed", "boolean", "video_error_or_removed", "boolean"),
-        ("description", "string", "description", "string"),
-        ("region", "string", "region", "string")
-    ],
-    transformation_ctx="applymapping1"
-)
+output_base = "s3://yt-cleaned-useast1-dev/youtube/raw_statistics/"
 
-# Resolve ambiguities and drop null fields
-resolvechoice2 = ResolveChoice.apply(
-    frame=applymapping1,
-    choice="make_struct",
-    transformation_ctx="resolvechoice2"
-)
+regions = [row["region"] for row in selected_df.select("region").distinct().collect()]
 
-dropnullfields3 = DropNullFields.apply(
-    frame=resolvechoice2,
-    transformation_ctx="dropnullfields3"
-)
+for region in regions:
+    region_df = selected_df.filter(col("region") == region).drop("region")
+    
+    # Coalesce to 1 file and write to the appropriate path
+    region_df.coalesce(1).write.mode("overwrite").parquet(f"{output_base}region={region}/")
 
-# Coalesce to a single partition, convert back to DynamicFrame
-coalesced_df = dropnullfields3.toDF().coalesce(1)
-df_final_output = DynamicFrame.fromDF(coalesced_df, glueContext, "df_final_output")
+spark.stop()
 
-# Write to S3 in Parquet format partitioned by region
-datasink4 = glueContext.write_dynamic_frame.from_options(
-    frame=df_final_output,
-    connection_type="s3",
-    connection_options={
-        "path": "s3://de-on-youtube-cleansed-useast1-dev/youtube/raw_statistics/",
-        "partitionKeys": ["region"]
-    },
-    format="parquet",
-    transformation_ctx="datasink4"
-)
-
-# Commit job
-job.commit()
